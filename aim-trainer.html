@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Simple Aim Trainer</title>
+    <style>
+      body {
+        margin: 0;
+        overflow: hidden;
+        background: #222;
+      }
+      #gameCanvas {
+        display: block;
+        margin: 0 auto;
+        background: #333;
+        border: 2px solid #444;
+      }
+      #score {
+        color: #fff;
+        font-size: 1.5em;
+        position: absolute;
+        top: 10px;
+        left: 10px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="score">Score: 0</div>
+    <canvas id="gameCanvas" width="800" height="600"></canvas>
+    <script>
+      const canvas = document.getElementById("gameCanvas");
+      const ctx = canvas.getContext("2d");
+      const scoreDiv = document.getElementById("score");
+      let score = 0;
+      let target = { x: 0, y: 0, r: 30 };
+
+      function randomPosition() {
+        target.x = Math.random() * (canvas.width - 2 * target.r) + target.r;
+        target.y = Math.random() * (canvas.height - 2 * target.r) + target.r;
+      }
+
+      function drawTarget() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.beginPath();
+        ctx.arc(target.x, target.y, target.r, 0, Math.PI * 2);
+        ctx.fillStyle = "#e74c3c";
+        ctx.fill();
+        ctx.strokeStyle = "#fff";
+        ctx.lineWidth = 3;
+        ctx.stroke();
+      }
+
+      canvas.addEventListener("mousedown", function (e) {
+        const rect = canvas.getBoundingClientRect();
+        const mouseX = e.clientX - rect.left;
+        const mouseY = e.clientY - rect.top;
+        const dx = mouseX - target.x;
+        const dy = mouseY - target.y;
+        if (dx * dx + dy * dy <= target.r * target.r) {
+          score++;
+          scoreDiv.textContent = "Score: " + score;
+          randomPosition();
+          drawTarget();
+        }
+      });
+
+      randomPosition();
+      drawTarget();
+    </script>
+  </body>
+</html>
