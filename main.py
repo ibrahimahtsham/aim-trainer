@@ -1,178 +1,242 @@
 #!/usr/bin/env python3
 """
-Simple FPS Aim Trainer using Ursina.
-Falls back gracefully if Ursina isn't installed.
+Simple FPS Aim Trainer using raw Panda3D (no Ursina).
+Mouse is locked/hidden during play. ESC opens a menu with a sensitivity slider (1-100).
+Click to shoot the target you're aiming at (center of screen).
+Stats: hits / shots / accuracy / elapsed time / sensitivity.
 """
 
-import sys
+from direct.showbase.ShowBase import ShowBase
+from direct.gui.DirectGui import DirectSlider, DirectButton, DirectFrame, DirectLabel
+from direct.gui.OnscreenText import OnscreenText
+from panda3d.core import (
+    WindowProperties, Vec3, Vec4, ClockObject, CollisionTraverser,
+    CollisionHandlerQueue, CollisionNode, CollisionRay, BitMask32,
+    CollisionSphere, loadPrcFileData
+)
 import random
+import time
 
-try:
-    from ursina import (
-        Ursina, Entity, camera, color, mouse, Text, Slider, Button,
-        Vec3, raycast, held_keys, time, destroy, window
-    )
-except ImportError:
-    print("Ursina not installed. Install dependencies first: pip install -r requirements.txt")
-    sys.exit(0)
-
-# Configurable parameters
-INITIAL_SENSITIVITY = 50  # range 1-100
-TARGET_COUNT = 8
-SPAWN_RADIUS = 25
-TARGET_MIN_SIZE = 0.6
-TARGET_MAX_SIZE = 1.4
-
-app = Ursina(borderless=False)
-window.title = 'Aim Trainer'
-window.exit_button.visible = False
-window.fps_counter.enabled = True
-
-# Hide system mouse & lock for FPS feel (pointer lock keeps cursor inside window)
-mouse.visible = False
-window.cursor = False
-mouse.locked = True  # lock captures the cursor so it stays centered / inside
-
-# Game state
-sensitivity_value = INITIAL_SENSITIVITY
-hits = 0
-shots = 0
-start_time = time.time()
-
-# Collections
-targets = []
-
-# UI Entities
-menu_background = Entity(parent=camera.ui, model='quad', scale=(1.4,0.9), color=color.rgba(0,0,0,180), enabled=False, z=-1)
-menu_title = Text(parent=menu_background, text='Settings', scale=2, position=(-0.27,0.35), enabled=False)
-
-sensitivity_text = Text(parent=menu_background, text=f'Sensitivity: {sensitivity_value}', position=(-0.55,0.15), enabled=False)
-sensitivity_slider = Slider(parent=menu_background, min=1, max=100, default=INITIAL_SENSITIVITY, step=1, scale=(0.8,0.7), position=(0,-0.05), enabled=False)
-resume_button = Button(parent=menu_background, text='Resume', scale=(0.3,0.1), position=(0,-0.35), color=color.azure, enabled=False)
-
-stats_text = Text(parent=camera.ui, text='', origin=(0,-0.5), position=(-0.88,0.45))
-
-# Reticle
-reticle = Entity(parent=camera.ui, model='quad', color=color.white, scale=(0.01,0.01), position=(0,0))
-
-# Sensitivity application factor
-SENSITIVITY_SCALE = 0.015  # base multiplier for rotation
-
-# Camera rotation state
-yaw = 0
-pitch = 0
-PITCH_LIMIT = 85
+# Basic window config
+loadPrcFileData('', 'window-title Aim Trainer (Panda3D)')
+loadPrcFileData('', 'show-frame-rate-meter 1')
+loadPrcFileData('', 'sync-video 0')  # disables vsync
+loadPrcFileData('', 'clock-mode limited')  # disables frame limit
+loadPrcFileData('', 'clock-frame-rate 0')  # unlimited FPS
 
 
-def spawn_target():
-    size = random.uniform(TARGET_MIN_SIZE, TARGET_MAX_SIZE)
-    # Random spherical distribution around origin, place targets in front hemisphere for convenience
-    angle_yaw = random.uniform(-160, 160)
-    angle_pitch = random.uniform(-30, 30)
-    distance = random.uniform(8, SPAWN_RADIUS)
-    # Convert to Cartesian
-    rad_y = angle_yaw * 3.14159 / 180
-    rad_p = angle_pitch * 3.14159 / 180
-    x = distance * random.uniform(0.7,1.0) * -1 * __import__('math').sin(rad_y)
-    z = distance * __import__('math').cos(rad_y)
-    y = distance * __import__('math').sin(rad_p) * 0.4
-    target = Entity(model='sphere', color=color.random_color(), scale=size, position=Vec3(x,y,z), collider='box')
-    targets.append(target)
+class AimTrainer(ShowBase):
+    def __init__(self):
+        super().__init__()
+        self.disableMouse()  # we control the camera
+
+        # Mouse/camera state
+        self.yaw = 0.0
+        self.pitch = 0.0
+        self.pitch_limit = 85.0
+
+        # Sensitivity model (degrees per pixel) range 1-100
+        self.max_sens = 100
+        self.sensitivity = 7  # default
+        self.min_deg_per_px = 0.02
+        self.max_deg_per_px = 0.9
+        self.curve_exp = 1.15  # a bit more curve for finer low end control
+        self.smoothing = 0.18
+        self._prev_yaw_delta = 0.0
+        self._prev_pitch_delta = 0.0
+
+        # Stats
+        self.hits = 0
+        self.shots = 0
+        self.start_time = time.time()
+
+        # Scene setup
+        self._setup_camera()
+        self._setup_picker()
+        self._setup_ui()
+        self._setup_targets()
+
+        self.menu_open = False
+        self._lock_mouse()
+
+        # Input
+        self.accept('mouse1', self.on_shoot)
+        self.accept('escape', self.toggle_menu)
+
+        # Update task
+        self.taskMgr.add(self.update_task, 'update')
+
+    # ---------- Setup ----------
+    def _setup_camera(self):
+        self.cam.setPos(0, 0, 0)
+        self.cam.setHpr(0, 0, 0)
+
+        # Reticle: Onscreen small plus sign
+        self.reticle = OnscreenText(text='+', fg=(1,1,1,1), pos=(0, 0), scale=0.08, mayChange=False)
+
+    def _setup_picker(self):
+        # Collision system for picking with a ray from camera center
+        self.picker = CollisionTraverser()
+        self.pq = CollisionHandlerQueue()
+
+        self.picker_node = CollisionNode('pickerRay')
+        self.picker_node.setFromCollideMask(BitMask32.bit(1))  # collide with into mask 1
+        self.picker_ray = CollisionRay()
+        self.picker_node.addSolid(self.picker_ray)
+        self.picker_np = self.camera.attachNewNode(self.picker_node)
+        self.picker.addCollider(self.picker_np, self.pq)
+
+    def _setup_ui(self):
+        # Stats text (top-left)
+        self.stats = OnscreenText(text='', fg=(1,1,1,1), pos=(-1.27, 0.9), align=0, scale=0.05, mayChange=True)
+
+        # Menu overlay
+        self.menu_frame = DirectFrame(frameColor=(0,0,0,0.7), frameSize=(-0.8,0.8,-0.5,0.5))
+        self.menu_frame.hide()
+
+        DirectLabel(text='Settings', scale=0.08, pos=(0, 0, 0.38), parent=self.menu_frame)
+        self.sens_label = DirectLabel(text=f'Sensitivity: {self.sensitivity}', scale=0.05, pos=(-0.55, 0, 0.18), parent=self.menu_frame)
+
+        self.sens_slider = DirectSlider(parent=self.menu_frame, range=(1, self.max_sens), value=self.sensitivity,
+                                        pageSize=5, pos=(0, 0, 0.05), scale=0.7, command=self.on_sens_change)
+        self.resume_btn = DirectButton(parent=self.menu_frame, text='Resume', scale=0.08, pos=(0, 0, -0.32), command=self.toggle_menu)
+
+    def _setup_targets(self):
+        self.targets = []
+        for _ in range(10):
+            self.spawn_target()
+
+    # ---------- Mouse locking ----------
+    def _lock_mouse(self):
+        # Hide cursor and confine/relative behavior by constantly re-centering
+        props = WindowProperties()
+        props.setCursorHidden(True)
+        self.win.requestProperties(props)
+        self._center_mouse()
+
+    def _unlock_mouse(self):
+        props = WindowProperties()
+        props.setCursorHidden(False)
+        self.win.requestProperties(props)
+
+    def _center_mouse(self):
+        if not self.mouseWatcherNode.hasMouse():
+            return
+        cw = self.win.getXSize()
+        ch = self.win.getYSize()
+        self.win.movePointer(0, cw // 2, ch // 2)
+
+    # ---------- Helpers ----------
+    def _deg_per_pixel(self):
+        t = (self.sensitivity / float(self.max_sens)) ** self.curve_exp
+        return self.min_deg_per_px + (self.max_deg_per_px - self.min_deg_per_px) * t
+
+    def update_stats(self):
+        elapsed = time.time() - self.start_time
+        acc = (self.hits / self.shots * 100.0) if self.shots else 0.0
+        self.stats.setText(f"Hits: {self.hits}  Shots: {self.shots}  Acc: {acc:.1f}%  Time: {elapsed:.1f}s  Sens: {self.sensitivity}")
+
+    # ---------- Menu / Sensitivity ----------
+    def toggle_menu(self):
+        self.menu_open = not self.menu_open
+        if self.menu_open:
+            self.menu_frame.show()
+            self._unlock_mouse()
+        else:
+            self.menu_frame.hide()
+            self._lock_mouse()
+            # recenter so next frame delta is sane
+            self._center_mouse()
+
+    def on_sens_change(self):
+        self.sensitivity = int(self.sens_slider['value'])
+        self.sens_label['text'] = f'Sensitivity: {self.sensitivity}'
+
+    # ---------- Targets ----------
+    def spawn_target(self):
+        # Use built-in smiley model for simplicity
+        model = self.loader.loadModel('models/smiley')
+        size = random.uniform(0.7, 1.4)
+        model.setScale(size)
+        # Position targets in a forward hemisphere
+        yaw = random.uniform(-160, 160)
+        pitch = random.uniform(-25, 25)
+        dist = random.uniform(8, 25)
+        # Convert to position
+        from math import radians, sin, cos
+        ry = radians(yaw)
+        rp = radians(pitch)
+        x = -sin(ry) * dist
+        y = cos(ry) * dist
+        z = sin(rp) * dist * 0.4
+        model.setPos(x, y, z)
+        model.setColor(random.random(), random.random(), random.random(), 1.0)
+        model.reparentTo(self.render)
+
+        # Collision sphere
+        cs = CollisionSphere(0, 0, 0, 0.5 * size)
+        cnode = CollisionNode('target')
+        cnode.addSolid(cs)
+        cnode.setIntoCollideMask(BitMask32.bit(1))
+        cnp = model.attachNewNode(cnode)
+        self.targets.append(model)
+
+    # ---------- Shooting ----------
+    def on_shoot(self):
+        if self.menu_open:
+            return
+        self.shots += 1
+        # Ray through center of lens
+        self.picker_ray.setFromLens(self.camNode, 0, 0)
+        self.picker.traverse(self.render)
+        if self.pq.getNumEntries() > 0:
+            self.pq.sortEntries()
+            entry = self.pq.getEntry(0)
+            # The collision node is named 'target'; get its parent model
+            hit_np = entry.getIntoNodePath().getParent()
+            if hit_np in self.targets:
+                self.hits += 1
+                hit_np.removeNode()
+                self.targets.remove(hit_np)
+                self.spawn_target()
+        self.update_stats()
+
+    # ---------- Per-frame update ----------
+    def update_task(self, task):
+
+        if not self.menu_open and self.mouseWatcherNode.hasMouse():
+            # Pointer delta from window center, then recenter
+            pointer = self.win.getPointer(0)
+            cx = self.win.getXSize() // 2
+            cy = self.win.getYSize() // 2
+            dx = pointer.getX() - cx
+            dy = pointer.getY() - cy
+            self._center_mouse()
+
+            if dx != 0 or dy != 0:
+                deg_per_px = self._deg_per_pixel()
+                # Invert yaw so moving mouse right rotates camera to the right (positive heading)
+                delta_yaw = -dx * deg_per_px
+                delta_pitch = -dy * deg_per_px
+                # smoothing (EMA)
+                if self.smoothing > 0:
+                    delta_yaw = self._prev_yaw_delta * (1 - self.smoothing) + delta_yaw * self.smoothing
+                    delta_pitch = self._prev_pitch_delta * (1 - self.smoothing) + delta_pitch * self.smoothing
+                    self._prev_yaw_delta = delta_yaw
+                    self._prev_pitch_delta = delta_pitch
+                # No clamp: allow full delta for zero input delay
+
+                self.yaw += delta_yaw
+                self.pitch += delta_pitch
+                if self.pitch > self.pitch_limit: self.pitch = self.pitch_limit
+                if self.pitch < -self.pitch_limit: self.pitch = -self.pitch_limit
+                self.cam.setHpr(self.yaw, self.pitch, 0)
+
+        # Update stats text
+        self.update_stats()
+        return task.cont
 
 
-def populate_targets():
-    for _ in range(TARGET_COUNT):
-        spawn_target()
-
-
-populate_targets()
-
-
-def update_stats():
-    elapsed = time.time() - start_time
-    acc = (hits / shots * 100) if shots else 0
-    stats_text.text = f"Hits: {hits}  Shots: {shots}  Acc: {acc:.1f}%  Time: {elapsed:.1f}s  Sens: {sensitivity_value}"
-
-
-def toggle_menu():
-    enabled = not menu_background.enabled
-    for e in (menu_background, menu_title, sensitivity_text, sensitivity_slider, resume_button):
-        e.enabled = enabled
-    mouse.visible = enabled
-    window.cursor = enabled
-    mouse.locked = not enabled  # unlock when menu open so user can interact, lock during play
-    if not enabled:
-        # reclaim focus when resuming to ensure lock works
-        try:
-            window.request_focus()
-        except Exception:
-            pass
-
-
-# Slider callback
-sensitivity_slider.on_value_changed = lambda val: set_sensitivity(int(val))
-
-
-def set_sensitivity(val: int):
-    global sensitivity_value
-    sensitivity_value = max(1, min(100, val))
-    sensitivity_text.text = f'Sensitivity: {sensitivity_value}'
-
-
-def resume():
-    toggle_menu()
-
-resume_button.on_click = resume
-
-
-# Shooting logic
-def shoot():
-    global shots, hits
-    shots += 1
-    origin = camera.world_position
-    direction = camera.forward
-    hit_info = raycast(origin, direction, distance=SPAWN_RADIUS+5, ignore=[reticle])
-    if hit_info.hit and hit_info.entity in targets:
-        hits += 1
-        destroy(hit_info.entity)
-        targets.remove(hit_info.entity)
-        spawn_target()
-    update_stats()
-
-
-# Ursina automatically calls update() each frame
-def update():
-    # Menu open: skip camera movement
-    if menu_background.enabled:
-        return
-
-    global yaw, pitch
-    # Ensure mouse stays locked during gameplay (e.g., after alt-tab)
-    if not mouse.locked:
-        mouse.locked = True
-        mouse.visible = False
-    # Mouse velocity gives delta movement
-    mv = mouse.velocity
-    if mv.length() > 0:
-        yaw += mv.x * sensitivity_value * SENSITIVITY_SCALE * 60 * time.dt
-        pitch -= mv.y * sensitivity_value * SENSITIVITY_SCALE * 60 * time.dt
-        pitch = max(-PITCH_LIMIT, min(PITCH_LIMIT, pitch))
-        camera.rotation_x = pitch
-        camera.rotation_y = yaw
-
-    if mouse.left:
-        shoot()
-
-    if held_keys.get('escape'):
-        # Prevent rapid toggle: delay using a simple cooldown
-        if not hasattr(toggle_menu, 'last_time') or time.time() - toggle_menu.last_time > 0.3:
-            toggle_menu.last_time = time.time()
-            toggle_menu()
-
-    update_stats()
-
-
-# Start with stats update
-update_stats()
-
-app.run()
+if __name__ == '__main__':
+    app = AimTrainer()
+    app.run()

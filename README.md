@@ -1,11 +1,11 @@
-# Simple FPS Aim Trainer (Python + Ursina)
+# Simple FPS Aim Trainer (Python + Panda3D)
 
 ## Features
 
 - Mouse-look camera (no WASD movement).
 - Click targets to score hits.
 - Press `ESC` to open a menu overlay.
-- Sensitivity slider (1–100) updates mouse look speed live.
+- Sensitivity slider (1–100) updates mouse look speed live (curved scaling for fine low-end control).
 - Basic stats: total shots, hits, accuracy %.
 
 ## Requirements
@@ -25,7 +25,7 @@ python main.py
 ## Controls
 
 - Move mouse: look around.
-- Left click: shoot (raycast straight ahead).
+- Left click: shoot (raycast from camera center).
 - ESC: toggle settings menu.
 - In menu: adjust sensitivity slider, click Resume to return.
 
